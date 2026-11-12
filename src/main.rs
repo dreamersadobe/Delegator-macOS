@@ -5,6 +5,7 @@ mod autostart;
 #[cfg(target_os = "macos")]
 #[path = "macos/autostart.rs"]
 mod autostart;
+mod cli_registry;
 mod config;
 #[cfg(target_os = "windows")]
 mod crypto;

@@ -17,6 +17,18 @@ pub struct GoogleApiAccount {
     pub enabled: bool,
 }
 
+/// User-selected local CLI. Discovery only checks files; it never runs them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CustomCli {
+    pub id: String,
+    pub name: String,
+    pub command: PathBuf,
+    #[serde(default)]
+    pub instructions_path: Option<PathBuf>,
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenCodeApiAccount {
     pub id: String,
@@ -457,6 +469,8 @@ pub struct AppConfig {
     /// The «API» tab presents all four the same way regardless.
     #[serde(default)]
     pub custom_providers: Vec<CustomProvider>,
+    #[serde(default)]
+    pub custom_clis: Vec<CustomCli>,
     /// Outbound proxies (DEV_CONTRACTS §7a). Always serialized — the mere
     /// presence of the key (even `[]`) makes it authoritative for the
     /// runtime, which then stops consulting the legacy `<RT>\proxy.json`.
@@ -527,6 +541,7 @@ impl Default for AppConfig {
             enabled_opencode_models: default_opencode_models(),
             known_opencode_models: default_known_opencode_models(),
             custom_providers: Vec::new(),
+            custom_clis: Vec::new(),
             proxies: Vec::new(),
             opencode_upgrade_checked_at: 0,
             provider_catalog_refreshed_at: 0,
@@ -1622,6 +1637,7 @@ fn default_ide_states() -> HashMap<String, bool> {
     let mut default_ides = HashMap::new();
     default_ides.insert("Antigravity".to_string(), false);
     default_ides.insert("Codex".to_string(), false);
+    default_ides.insert("Ensemble".to_string(), false);
     default_ides.insert("OpenCode".to_string(), false);
     default_ides.insert("Cursor".to_string(), false);
     default_ides.insert("Claude".to_string(), false);
@@ -1711,6 +1727,26 @@ pub mod tests_support {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn custom_clis_default_empty_and_round_trip_without_changing_ide_choices() {
+        let mut old = serde_json::to_value(AppConfig::default()).unwrap();
+        old.as_object_mut().unwrap().remove("custom_clis");
+        let mut config: AppConfig = serde_json::from_value(old).unwrap();
+        assert!(config.custom_clis.is_empty());
+        config.ide_states.insert("Codex".into(), true);
+        config.custom_clis.push(CustomCli {
+            id: "cli-test".into(),
+            name: "My CLI".into(),
+            command: PathBuf::from("my-cli"),
+            instructions_path: None,
+            enabled: false,
+        });
+        let restored: AppConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(restored.custom_clis, config.custom_clis);
+        assert_eq!(restored.ide_states.get("Codex"), Some(&true));
+        assert!(!restored.custom_clis[0].enabled);
+    }
     use super::*;
 
     #[test]
