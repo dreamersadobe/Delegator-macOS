@@ -342,6 +342,9 @@ pub fn apply_ide_hooks(config: &AppConfig) {
     for (name, enabled) in &config.ide_states {
         let _ = IdeDetector::apply_hook(name, *enabled && config.delegator_enabled);
     }
+    for cli in &config.custom_clis {
+        let _ = IdeDetector::apply_custom_hook(cli, cli.enabled && config.delegator_enabled);
+    }
     IdeDetector::migrate_legacy_installation(config.delegator_enabled);
 }
 

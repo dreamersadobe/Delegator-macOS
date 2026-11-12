@@ -459,6 +459,7 @@ impl IdeEnv {
                 self.home.join(".gemini/config/AGENTS.md"),
             ],
             "Codex" => vec![self.home.join(".codex/AGENTS.md")],
+            "Ensemble" => vec![self.home.join(".ai-ensemble/AGENTS.md")],
             "OpenCode" => vec![self.home.join(".config/opencode/AGENTS.md")],
             // `.mdc`, not `.md`: that is the extension Cursor's own rule UI, its
             // @-mentions and its filename handling all assume, and only a rule
@@ -529,6 +530,15 @@ impl IdeEnv {
                 self.home.join(".codex/history.jsonl"),
                 self.local_appdata.join("OpenAI/Codex"),
             ],
+            // Concrete CLI entry points, not its runs or hook directory: a
+            // leftover Delegator block must never manufacture an installation.
+            "Ensemble" => vec![
+                self.local_appdata
+                    .join("Programs/AIEnsemble/bin/ensemble.js"),
+                self.home
+                    .join(".local/share/ai-ensemble-cli/bin/ensemble.js"),
+                self.home.join(".local/bin/ensemble"),
+            ],
             "OpenCode" => vec![
                 self.home.join(".local/share/opencode"),
                 self.home.join(".config/opencode/opencode.json"),
@@ -570,6 +580,8 @@ impl IdeEnv {
     /// Executable stems whose presence on PATH proves the IDE's CLI is installed.
     fn command_markers(name: &str) -> &'static [&'static str] {
         match name {
+            "Antigravity" => &["agy", "antigravity"],
+            "Ensemble" => &["ensemble"],
             "OpenCode" => &["opencode"],
             // A system-wide VSCodium installs to `C:\Program Files\VSCodium`,
             // which no `install_markers` path covers; both installers put
@@ -661,9 +673,10 @@ impl SelfInstall {
 pub struct IdeDetector;
 
 impl IdeDetector {
-    const IDE_NAMES: [&'static str; 7] = [
+    const IDE_NAMES: [&'static str; 8] = [
         "Antigravity",
         "Codex",
+        "Ensemble",
         "OpenCode",
         "Cursor",
         "Claude",
@@ -744,6 +757,70 @@ impl IdeDetector {
         Self::apply_hook_in(&IdeEnv::current(), name, enable)
     }
 
+    pub fn validate_custom_target(path: &Path) -> Result<(), String> {
+        if !crate::cli_registry::valid_instructions_path(path) {
+            return Err("Выберите полный путь к Markdown-файлу инструкций (.md или .mdc).".into());
+        }
+        let env = IdeEnv::current();
+        if Self::IDE_NAMES.iter().any(|name| {
+            env.target_files(name)
+                .iter()
+                .any(|target| crate::cli_registry::same_path(target, path))
+        }) {
+            return Err(
+                "Этот файл уже управляется встроенной интеграцией. Используйте её переключатель."
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn apply_custom_hook(cli: &crate::config::CustomCli, enable: bool) -> Result<(), String> {
+        Self::apply_custom_hook_in(&IdeEnv::current(), cli, enable)
+    }
+
+    fn apply_custom_hook_in(
+        env: &IdeEnv,
+        cli: &crate::config::CustomCli,
+        enable: bool,
+    ) -> Result<(), String> {
+        let Some(path) = &cli.instructions_path else {
+            return if enable {
+                Err("Для подключения укажите файл инструкций, который читает этот CLI.".into())
+            } else {
+                Ok(())
+            };
+        };
+        Self::validate_custom_target(path)?;
+        if enable && (!crate::cli_registry::is_detected(cli) || !env.runtime_ready) {
+            return Err("CLI или runtime Delegator не обнаружен.".into());
+        }
+        let existing = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !enable {
+                    return Ok(());
+                }
+                String::new()
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let hook = get_hook_text(env)
+            .replace(DELEGATOR_HOOK_HEADER, "")
+            .replace(DELEGATOR_HOOK_FOOTER, "");
+        let updated =
+            crate::cli_registry::update_hook_text(&existing, cli, enable.then_some(hook.trim()))?;
+        if updated == existing {
+            return Ok(());
+        }
+        if enable {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+        }
+        fs::write(path, updated).map_err(|error| error.to_string())
+    }
+
     fn apply_hook_in(env: &IdeEnv, name: &str, enable: bool) -> Result<(), String> {
         if env.target_files(name).is_empty() {
             return Err(format!("Unknown IDE: {}", name));
@@ -754,6 +831,9 @@ impl IdeDetector {
         // Disabling always runs so hooks left by earlier versions get cleaned.
         if enable && !env.is_detected(name) {
             return Err(format!("IDE not detected, hook skipped: {}", name));
+        }
+        if enable && name == "Ensemble" && !env.runtime_ready {
+            return Err("Delegator runtime not found, Ensemble hook skipped".to_string());
         }
 
         let paths = if enable {
@@ -896,6 +976,9 @@ impl IdeDetector {
 
     pub fn remove_all_hooks() {
         Self::remove_all_hooks_in(&IdeEnv::current());
+        for cli in crate::config::AppConfig::load_readonly().custom_clis {
+            let _ = Self::apply_custom_hook(&cli, false);
+        }
     }
 
     fn remove_all_hooks_in(env: &IdeEnv) {
@@ -1016,7 +1099,20 @@ impl IdeDetector {
         let cleaned_content = strip_legacy_delegator_prose(&cleaned_content);
 
         let final_content = if enable {
-            format!("{}{}", get_hook_text(env), cleaned_content.trim_start())
+            let mut hook = get_hook_text(env);
+            if name == "Ensemble" {
+                // Ensemble consumes this explicit machine contract itself;
+                // its read-only workers do not execute Markdown instructions.
+                let marker = serde_json::json!({
+                    "schemaVersion": 1,
+                    "runtimeEntry": env.runtime_entry,
+                });
+                hook = hook.replace(
+                    DELEGATOR_HOOK_FOOTER,
+                    &format!("<!-- AI_ENSEMBLE_RUNTIME {marker} -->\n{DELEGATOR_HOOK_FOOTER}"),
+                );
+            }
+            format!("{}{}", hook, cleaned_content.trim_start())
         } else {
             cleaned_content
         };
@@ -1223,6 +1319,10 @@ mod tests {
 
         profile.write("home/.gemini/antigravity/state.json", "{}");
         profile.write("home/.codex/config.toml", "model = \"gpt\"\n");
+        profile.write(
+            "localappdata/Programs/AIEnsemble/bin/ensemble.js",
+            "// CLI\n",
+        );
         profile.write("home/.config/opencode/opencode.json", "{}");
         profile.mkdir("home/.cursor/extensions");
         profile.write("home/.claude/settings.json", "{}");
@@ -1274,6 +1374,134 @@ mod tests {
         assert!(!env.is_detected("OpenCode"));
         env.path_dirs = vec![bin];
         assert!(env.is_detected("OpenCode"));
+    }
+
+    #[test]
+    fn ensemble_is_detected_from_windows_and_macos_installations() {
+        for marker in [
+            "localappdata/Programs/AIEnsemble/bin/ensemble.js",
+            "home/.local/share/ai-ensemble-cli/bin/ensemble.js",
+            "home/.local/bin/ensemble",
+        ] {
+            let profile = TempProfile::new("ensemble-install");
+            let env = profile.env();
+            assert!(!env.is_detected("Ensemble"));
+            profile.write(marker, "// CLI\n");
+            assert!(env.is_detected("Ensemble"), "marker: {marker}");
+        }
+    }
+
+    #[test]
+    fn ensemble_path_command_is_detected_without_a_profile() {
+        for executable in ["ensemble", "ensemble.cmd", "ensemble.exe"] {
+            let profile = TempProfile::new("ensemble-path");
+            let mut env = profile.env();
+            let bin = profile.mkdir("bin");
+            profile.write(&format!("bin/{executable}"), "// CLI\n");
+            assert!(!env.is_detected("Ensemble"));
+            env.path_dirs.push(bin);
+            assert!(env.is_detected("Ensemble"));
+        }
+    }
+
+    #[test]
+    fn ensemble_hook_round_trip_preserves_user_instructions() {
+        let profile = TempProfile::new("ensemble-hook");
+        let env = profile.env();
+        profile.write(
+            "localappdata/Programs/AIEnsemble/bin/ensemble.js",
+            "// CLI\n",
+        );
+        profile.write(
+            "home/.ai-ensemble/AGENTS.md",
+            "User instructions stay here.\n",
+        );
+        IdeDetector::apply_hook_in(&env, "Ensemble", true).expect("enable Ensemble");
+        let path = env.home.join(".ai-ensemble/AGENTS.md");
+        let content = fs::read_to_string(&path).unwrap();
+        let marker = content
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("<!-- AI_ENSEMBLE_RUNTIME ")
+                    .and_then(|line| line.strip_suffix(" -->"))
+            })
+            .expect("machine hook marker");
+        let payload: serde_json::Value = serde_json::from_str(marker).unwrap();
+        assert_eq!(payload["schemaVersion"], 1);
+        assert_eq!(
+            payload["runtimeEntry"],
+            env.runtime_entry.to_string_lossy().as_ref()
+        );
+        assert!(env.is_hooked("Ensemble"));
+        IdeDetector::apply_hook_in(&env, "Ensemble", true).expect("idempotent enable");
+        assert_eq!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .matches("AI_ENSEMBLE_RUNTIME")
+                .count(),
+            1
+        );
+        IdeDetector::apply_hook_in(&env, "Ensemble", false).expect("disable Ensemble");
+        assert!(!env.is_hooked("Ensemble"));
+        assert_eq!(
+            fs::read_to_string(path).unwrap().trim(),
+            "User instructions stay here."
+        );
+    }
+
+    #[test]
+    fn ensemble_leftover_hook_is_not_an_installation() {
+        let profile = TempProfile::new("ensemble-leftover");
+        let env = profile.env();
+        profile.write("home/.ai-ensemble/AGENTS.md", &get_hook_text(&env));
+        profile.write("home/.ai-ensemble/runs/old/final.md", "Old answer\n");
+        assert!(!env.is_detected("Ensemble"));
+        assert!(IdeDetector::apply_hook_in(&env, "Ensemble", true).is_err());
+        IdeDetector::apply_hook_in(&env, "Ensemble", false).expect("remove stale hook");
+        assert!(!env.is_hooked("Ensemble"));
+    }
+
+    #[test]
+    fn custom_cli_hook_enable_pause_resume_and_remove_preserve_text() {
+        let profile = TempProfile::new("custom-cli");
+        let env = profile.env();
+        let command = profile.write("bin/my-cli.cmd", "@echo off\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&command, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let instructions = profile.write("home/custom/AGENTS.md", "User instructions.\r\n");
+        let cli = crate::config::CustomCli {
+            id: "cli-test".into(),
+            name: "My CLI".into(),
+            command,
+            instructions_path: Some(instructions.clone()),
+            enabled: true,
+        };
+        for _ in 0..2 {
+            IdeDetector::apply_custom_hook_in(&env, &cli, true).unwrap();
+            assert!(crate::cli_registry::is_hooked(&cli));
+            IdeDetector::apply_custom_hook_in(&env, &cli, false).unwrap();
+            assert_eq!(
+                fs::read_to_string(&instructions).unwrap(),
+                "User instructions.\r\n"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_cli_without_executable_cannot_create_instruction_files() {
+        let profile = TempProfile::new("custom-cli-missing");
+        let cli = crate::config::CustomCli {
+            id: "cli-test".into(),
+            name: "Missing".into(),
+            command: profile.root.join("missing.exe"),
+            instructions_path: Some(profile.home().join("new/AGENTS.md")),
+            enabled: false,
+        };
+        assert!(IdeDetector::apply_custom_hook_in(&profile.env(), &cli, true).is_err());
+        assert!(!cli.instructions_path.unwrap().exists());
     }
 
     /// Everything under `root`, deepest first. Used to prove that a profile is

@@ -14,7 +14,7 @@ $excludedRoots = @(
     # every secret scan by ten.
     (Join-Path $projectRoot ".claude")
 )
-$sourceExtensions = @(".rs", ".py", ".ps1", ".cmd", ".iss", ".toml", ".json", ".md", ".txt", ".yml", ".yaml")
+$sourceExtensions = @(".rs", ".py", ".js", ".mjs", ".cjs", ".sh", ".ps1", ".cmd", ".iss", ".toml", ".json", ".md", ".txt", ".yml", ".yaml")
 
 $sourceFiles = Get-ChildItem -LiteralPath $projectRoot -Recurse -File | Where-Object {
     $path = $_.FullName

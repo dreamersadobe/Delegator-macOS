@@ -54,6 +54,7 @@ pub struct ProviderRefreshOutcome {
 }
 
 pub enum AppMessage {
+    CustomClisDiscovered(Vec<crate::cli_registry::DiscoveredCli>),
     /// New status line from the core supervisor thread.
     CoreStatus(String),
     GeminiModelsFetched(Result<(Vec<ModelInfo>, HashMap<String, f64>), String>),
@@ -172,6 +173,13 @@ pub struct DelegatorApp {
     new_provider_base_url: String,
     new_provider_model: String,
     status_message: String,
+    custom_cli_candidates: Vec<crate::cli_registry::DiscoveredCli>,
+    custom_cli_searching: bool,
+    custom_cli_filter: String,
+    new_cli_name: String,
+    new_cli_command: String,
+    new_cli_instructions: String,
+    custom_cli_error: Option<String>,
 
     // Models Lists
     gemini_models: Vec<ModelInfo>,
@@ -314,6 +322,13 @@ impl DelegatorApp {
             new_provider_base_url: String::new(),
             new_provider_model: String::new(),
             status_message: runtime_status,
+            custom_cli_candidates: Vec::new(),
+            custom_cli_searching: false,
+            custom_cli_filter: String::new(),
+            new_cli_name: String::new(),
+            new_cli_command: String::new(),
+            new_cli_instructions: String::new(),
+            custom_cli_error: None,
             gemini_models: Vec::new(),
             opencode_models: Vec::new(),
             opencode_catalog_is_fallback: false,
@@ -397,6 +412,143 @@ impl DelegatorApp {
 
     fn sync_all_ide_hooks(&mut self) {
         background::apply_ide_hooks(&self.config);
+    }
+
+    fn draw_custom_cli_panel(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.strong("Собственные CLI");
+        ui.label("Поиск находит команды в PATH, не запускает их.");
+        if ui
+            .add_enabled(
+                !self.custom_cli_searching,
+                egui::Button::new("Обнаружить CLI"),
+            )
+            .clicked()
+        {
+            self.custom_cli_searching = true;
+            self.custom_cli_error = None;
+            let tx = self.tx.clone();
+            let ctx = self.egui_ctx.clone();
+            std::thread::spawn(move || {
+                let candidates =
+                    crate::cli_registry::discover_in(&crate::cli_registry::discovery_paths());
+                let _ = tx.send(AppMessage::CustomClisDiscovered(candidates));
+                ctx.request_repaint();
+            });
+        }
+        if self.custom_cli_searching {
+            ui.spinner();
+        }
+        if !self.custom_cli_candidates.is_empty() {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.custom_cli_filter).hint_text("Фильтр команд"),
+            );
+            let filter = self.custom_cli_filter.to_lowercase();
+            egui::ScrollArea::vertical()
+                .id_salt("custom-cli-candidates")
+                .max_height(140.0)
+                .show(ui, |ui| {
+                    for candidate in self
+                        .custom_cli_candidates
+                        .iter()
+                        .filter(|entry| entry.name.to_lowercase().contains(&filter))
+                    {
+                        if ui
+                            .selectable_label(false, &candidate.name)
+                            .on_hover_text(candidate.command.display().to_string())
+                            .clicked()
+                        {
+                            self.new_cli_command = candidate.command.to_string_lossy().into_owned();
+                            self.new_cli_name = candidate.name.clone();
+                        }
+                    }
+                });
+        }
+        ui.add(egui::TextEdit::singleline(&mut self.new_cli_name).hint_text("Название CLI"));
+        ui.add(
+            egui::TextEdit::singleline(&mut self.new_cli_command)
+                .hint_text("Команда или полный путь"),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut self.new_cli_instructions)
+                .hint_text("Файл инструкций .md / .mdc (необязательно)"),
+        );
+        ui.small("Укажите файл, который этот CLI действительно читает. Без файла CLI будет только обнаруживаться.");
+        if ui.button("Добавить выбранный CLI").clicked() {
+            let result = crate::cli_registry::prepare(
+                &self.new_cli_name,
+                &self.new_cli_command,
+                &self.new_cli_instructions,
+                &self.config.custom_clis,
+            )
+            .and_then(|cli| {
+                if let Some(path) = &cli.instructions_path {
+                    IdeDetector::validate_custom_target(path)?;
+                }
+                Ok(cli)
+            });
+            match result {
+                Ok(cli) => {
+                    self.config.custom_clis.push(cli);
+                    self.config.save();
+                    self.new_cli_name.clear();
+                    self.new_cli_command.clear();
+                    self.new_cli_instructions.clear();
+                    self.custom_cli_error = None;
+                }
+                Err(error) => self.custom_cli_error = Some(error),
+            }
+        }
+        let mut remove = None;
+        for (index, cli) in self.config.custom_clis.clone().iter().enumerate() {
+            let detected = crate::cli_registry::is_detected(cli);
+            let mut enabled = cli.enabled;
+            ui.horizontal_wrapped(|ui| {
+                let checkbox = ui
+                    .add_enabled(
+                        detected && cli.instructions_path.is_some(),
+                        egui::Checkbox::new(&mut enabled, &cli.name),
+                    )
+                    .on_hover_text(cli.command.display().to_string());
+                if checkbox.changed() {
+                    match IdeDetector::apply_custom_hook(
+                        cli,
+                        enabled && self.config.delegator_enabled,
+                    ) {
+                        Ok(()) => {
+                            self.config.custom_clis[index].enabled = enabled;
+                            self.config.save();
+                            self.custom_cli_error = None;
+                        }
+                        Err(error) => self.custom_cli_error = Some(error),
+                    }
+                }
+                ui.label(if detected {
+                    "Обнаружен"
+                } else {
+                    "Не обнаружен"
+                });
+                if crate::cli_registry::is_hooked(cli) && self.config.delegator_enabled {
+                    ui.label("[Подключено]");
+                }
+                if ui.small_button("Удалить").clicked() {
+                    remove = Some(index);
+                }
+            });
+        }
+        if let Some(index) = remove {
+            match IdeDetector::apply_custom_hook(&self.config.custom_clis[index], false) {
+                Ok(()) => {
+                    self.config.custom_clis.remove(index);
+                    self.config.save();
+                    self.custom_cli_error = None;
+                }
+                Err(error) => self.custom_cli_error = Some(error),
+            }
+        }
+        if let Some(error) = &self.custom_cli_error {
+            ui.colored_label(self.theme.warning_color(), error);
+        }
     }
 
     fn refresh_models(&mut self) {
@@ -2053,6 +2205,13 @@ impl eframe::App for DelegatorApp {
         // Handle async responses
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
+                AppMessage::CustomClisDiscovered(candidates) => {
+                    self.custom_cli_error = candidates.is_empty().then(|| {
+                        "Команды в PATH не найдены. Можно указать полный путь к CLI.".to_string()
+                    });
+                    self.custom_cli_candidates = candidates;
+                    self.custom_cli_searching = false;
+                }
                 AppMessage::CoreStatus(status) => self.status_message = status,
                 AppMessage::GeminiModelsFetched(res) => {
                     self.is_loading_gemini = false;
@@ -2302,7 +2461,7 @@ impl eframe::App for DelegatorApp {
             // Tab Content
             match self.active_tab {
                 SelectedTab::Ides => {
-                    ui.label("Отметьте IDE, которые будут делегировать задачи Delegator.");
+                    ui.label("Отметьте IDE и CLI, которые будут делегировать задачи Delegator.");
                     // On pause the hooks are removed, so an agent legitimately
                     // reports that it knows nothing about Delegator. Say so here
                     // instead of leaving the user to guess.
@@ -2371,6 +2530,7 @@ impl eframe::App for DelegatorApp {
                                 });
                             }
 
+                            self.draw_custom_cli_panel(ui);
                             self.draw_web_column(&mut columns[1]);
                         });
                     });
